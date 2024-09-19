@@ -1,11 +1,13 @@
 use anyhow::{bail, Result};
+use bytes::BytesMut;
+use futures::{SinkExt, StreamExt};
 use itertools::Itertools;
 use rand::Rng;
 use std::collections::HashMap;
 use std::env;
 use std::time::Instant;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
 #[derive(Debug, bincode::Encode, bincode::Decode)]
 struct Msg {
@@ -28,8 +30,10 @@ async fn main() -> Result<()> {
 async fn serve() -> Result<()> {
     let mut rand = rand::thread_rng();
     let listener = TcpListener::bind("localhost:9966").await?;
-    let (mut stream, _) = listener.accept().await?;
-    let mut buf = [0u8; 1024];
+    let (stream, _) = listener.accept().await?;
+    let mut stream = FramedWrite::new(stream, LengthDelimitedCodec::new());
+
+    let mut buf = BytesMut::with_capacity(4096);
     let config = bincode::config::legacy();
 
     loop {
@@ -41,35 +45,37 @@ async fn serve() -> Result<()> {
             duration: the_u64,
             user_id: rand.gen(),
         };
-        let len = bincode::encode_into_slice(msg, &mut buf[4..], config)?;
-        let len = len + 4;
-        buf[..4].copy_from_slice(&(len as u32).to_le_bytes());
-        stream.write_all(&buf[..len]).await?;
+
+        bincode::encode_into_writer(msg, Writer { buf: &mut buf }, config)?;
+        stream.send(buf.split().freeze()).await?;
     }
 }
 
 async fn client() -> Result<()> {
-    let mut client = BufReader::new(TcpStream::connect("localhost:9966").await?);
-    let mut buf = [0u8; 1024];
+    let client = TcpStream::connect("localhost:9966").await?;
+    let mut client = FramedRead::new(client, LengthDelimitedCodec::new());
+
     let config = bincode::config::legacy();
 
     let mut hash = HashMap::<u64, u64>::with_capacity(100_000_000);
 
     let mut counter = 0usize;
     let start = Instant::now();
-    loop {
-        let mut len_bytes = [0u8; 4];
-        client.read_exact(&mut len_bytes).await?;
-        let len = u32::from_le_bytes(len_bytes) as usize;
-        let len = len - 4;
-        client.read_exact(&mut buf[..len]).await?;
+    while let Some(msg) = client.next().await {
+        let msg = msg?;
 
-        let msg: Msg = bincode::decode_from_slice(&buf, config)?.0;
+        let msg: Msg = bincode::decode_from_slice(&msg, config)?.0;
         *hash.entry(msg.id).or_insert(0) += 1;
 
         counter += 1;
 
-        if counter % 2usize.pow(23) == 0 {
+        if counter % 2usize.pow(22) == 0 {
+            let elapsed = start.elapsed();
+            let msgs_per_second = counter as f64 / elapsed.as_secs_f64() / 1e6;
+            println!("{msgs_per_second:.3}M/s");
+        }
+
+        if counter % 2usize.pow(28) == 0 {
             let mut sample = hash.iter().take(10_000).map(|(_, v)| *v).collect_vec();
             sample.sort_unstable();
             let median = sample[sample.len() / 2];
@@ -88,5 +94,17 @@ async fn client() -> Result<()> {
             let msgs_per_second = counter as f64 / elapsed.as_secs_f64() / 1e6;
             println!("Received {counter} messages, {} ids tracked, {} rejected for being below {median}, {msgs_per_second:.2}M/s, top k: {top:?}", hash.len(), before - hash.len());
         }
+    }
+    Ok(())
+}
+
+struct Writer<'b> {
+    buf: &'b mut BytesMut,
+}
+
+impl<'b> bincode::enc::write::Writer for Writer<'b> {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), bincode::error::EncodeError> {
+        self.buf.extend_from_slice(bytes);
+        Ok(())
     }
 }
