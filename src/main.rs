@@ -70,14 +70,23 @@ async fn client() -> Result<()> {
         counter += 1;
 
         if counter % 2usize.pow(23) == 0 {
+            let mut sample = hash.iter().take(10_000).map(|(_, v)| *v).collect_vec();
+            sample.sort_unstable();
+            let median = sample[sample.len() / 2];
+
+            let before = hash.len();
+
+            hash.retain(|_, v| *v >= median);
+
             let top = hash
                 .iter()
+                .filter(|(_, v)| **v > median)
                 .sorted_by_key(|(_, views)| std::cmp::Reverse(*views))
                 .take(10)
                 .collect_vec();
             let elapsed = start.elapsed();
             let msgs_per_second = counter as f64 / elapsed.as_secs_f64() / 1e6;
-            println!("Received {counter} messages, {} ids tracked, {msgs_per_second:.2}M/s, top k: {top:?}", hash.len());
+            println!("Received {counter} messages, {} ids tracked, {} rejected for being below {median}, {msgs_per_second:.2}M/s, top k: {top:?}", hash.len(), before - hash.len());
         }
     }
 }
